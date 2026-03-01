@@ -171,7 +171,10 @@ impl ClientHelloInput {
 
         // Generate key_share even in PAKE mode — Apple clients send both
         // key_share and PAKE extension; the server chooses which to use.
-        let key_share = if self.config.needs_key_share() {
+        let key_share = if self
+            .config
+            .supports_version(ProtocolVersion::TLSv1_3)
+        {
             Some(tls13::initial_key_share(
                 &self.config,
                 &self.server_name,

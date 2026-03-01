@@ -20,8 +20,8 @@ use crate::kernel::KernelConnection;
 use crate::log::trace;
 use crate::msgs::enums::NamedGroup;
 use crate::msgs::handshake::ClientExtensionsInput;
-use crate::pake::PakeClient;
 use crate::msgs::persist;
+use crate::pake::PakeClient;
 use crate::suites::{ExtractedSecrets, SupportedCipherSuite};
 use crate::sync::Arc;
 #[cfg(feature = "std")]
@@ -403,10 +403,6 @@ impl ClientConfig {
     /// extra care.
     pub fn dangerous(&mut self) -> danger::DangerousClientConfig<'_> {
         danger::DangerousClientConfig { cfg: self }
-    }
-
-    pub(super) fn needs_key_share(&self) -> bool {
-        self.supports_version(ProtocolVersion::TLSv1_3) && self.pake.is_none()
     }
 
     /// We support a given TLS version if it's quoted in the configured

@@ -679,6 +679,54 @@ fn hybrid_kx_component_share_not_offered_unless_supported_separately() {
     assert_eq!(key_shares[0].group, NamedGroup::X25519MLKEM768);
 }
 
+#[derive(Debug)]
+struct FixedPakeClient;
+
+impl crate::pake::PakeClient for FixedPakeClient {
+    fn client_hello_extension(&self) -> Result<Vec<u8>, Error> {
+        Ok(vec![0x01, 0x02, 0x03])
+    }
+
+    fn complete_with_server_hello_extension(
+        &self,
+        _server_hello_extension: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        Ok(vec![0xAA; 32])
+    }
+}
+
+#[test]
+fn pake_clienthello_includes_keyshare_and_pake_extension() {
+    let mut config = ClientConfig::builder_with_provider(default_provider_for_test().into())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth();
+    config.pake = Some(Arc::new(FixedPakeClient));
+
+    let ch = client_hello_sent_for_config(config).unwrap();
+    let key_shares = ch
+        .extensions
+        .key_shares
+        .as_ref()
+        .unwrap();
+
+    assert!(!key_shares.is_empty());
+    assert!(ch.extensions.pake.is_some());
+}
+
+fn default_provider_for_test() -> CryptoProvider {
+    #[cfg(feature = "aws-lc-rs")]
+    {
+        return crate::crypto::aws_lc_rs::default_provider();
+    }
+
+    #[cfg(all(not(feature = "aws-lc-rs"), feature = "ring"))]
+    {
+        return crate::crypto::ring::default_provider();
+    }
+}
+
 fn client_hello_sent_for_config(config: ClientConfig) -> Result<ClientHelloPayload, Error> {
     let mut conn =
         ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;

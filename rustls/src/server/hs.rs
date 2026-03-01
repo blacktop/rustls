@@ -177,8 +177,13 @@ impl ExtensionProcessing {
             ocsp_response.take();
         }
 
-        self.validate_server_cert_type_extension(hello, config, cx)?;
-        self.validate_client_cert_type_extension(hello, config, cx)?;
+        // PAKE mode: certificates are not exchanged, so certificate type
+        // negotiation is irrelevant. Skip validation to tolerate clients
+        // that advertise RawPublicKey-only in their ClientHello.
+        if config.pake.is_none() {
+            self.validate_server_cert_type_extension(hello, config, cx)?;
+            self.validate_client_cert_type_extension(hello, config, cx)?;
+        }
 
         Ok(())
     }
@@ -454,8 +459,46 @@ impl ExpectClientHello {
         };
         let certkey = ActiveCertifiedKey::from_certified_key(&certkey);
 
-        let (suite, skxg) = self
-            .choose_suite_and_kx_group(
+        let (suite, skxg) = if self.config.pake.is_some() {
+            // PAKE mode: select cipher suite from client/server intersection
+            // without KX group constraints (PAKE replaces ECDHE).
+            let sig_alg = certkey.get_key().algorithm();
+            let suite = self
+                .config
+                .provider
+                .cipher_suites
+                .iter()
+                .find(|s| {
+                    s.version().version == version
+                        && s.usable_for_protocol(cx.common.protocol)
+                        && s.usable_for_signature_algorithm(sig_alg)
+                        && client_hello
+                            .cipher_suites
+                            .contains(&s.suite())
+                })
+                .ok_or_else(|| {
+                    cx.common.send_fatal_alert(
+                        AlertDescription::HandshakeFailure,
+                        PeerIncompatible::NoCipherSuitesInCommon,
+                    )
+                })?;
+            // Dummy KX group — not used in PAKE mode.
+            let skxg = self
+                .config
+                .provider
+                .kx_groups
+                .first()
+                .ok_or_else(|| {
+                    cx.common.send_fatal_alert(
+                        AlertDescription::InternalError,
+                        Error::General(
+                            "no kx groups in provider".into(),
+                        ),
+                    )
+                })?;
+            (*suite, *skxg)
+        } else {
+            self.choose_suite_and_kx_group(
                 version,
                 certkey.get_key().algorithm(),
                 cx.common.protocol,
@@ -468,7 +511,8 @@ impl ExpectClientHello {
             .map_err(|incompat| {
                 cx.common
                     .send_fatal_alert(AlertDescription::HandshakeFailure, incompat)
-            })?;
+            })?
+        };
 
         debug!("decided upon suite {suite:?}");
         cx.common.suite = Some(suite);

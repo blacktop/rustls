@@ -137,6 +137,16 @@ impl KeySchedulePreHandshake {
             .input_secret(shared_secret.secret_bytes());
         KeyScheduleHandshakeStart { ks: self.ks }
     }
+
+    /// Variant of [`Self::into_handshake`] for callers that already have raw
+    /// shared secret bytes (for example, PAKE integrations).
+    pub(crate) fn into_handshake_secret_bytes(
+        mut self,
+        shared_secret: &[u8],
+    ) -> KeyScheduleHandshakeStart {
+        self.ks.input_secret(shared_secret);
+        KeyScheduleHandshakeStart { ks: self.ks }
+    }
 }
 
 /// Creates a key schedule with a PSK.

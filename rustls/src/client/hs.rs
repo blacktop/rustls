@@ -22,6 +22,7 @@ use crate::conn::ConnectionRandoms;
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
 use crate::enums::{
     AlertDescription, CertificateType, CipherSuite, ContentType, HandshakeType, ProtocolVersion,
+    SignatureScheme,
 };
 use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
@@ -36,6 +37,7 @@ use crate::msgs::handshake::{
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
+use crate::pake::PakeClient;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::verify::ServerCertVerifier;
@@ -43,6 +45,12 @@ use crate::verify::ServerCertVerifier;
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
 pub(super) type ClientContext<'a> = crate::common_state::Context<'a, ClientConnectionData>;
+
+#[derive(Clone, Debug)]
+pub(super) struct ClientPakeState {
+    pub(super) provider: Arc<dyn PakeClient>,
+    pub(super) client_hello_extension: Vec<u8>,
+}
 
 struct ExpectServerHello {
     input: ClientHelloInput,
@@ -74,6 +82,7 @@ pub(super) struct ClientHelloInput {
     pub(super) session_id: SessionId,
     pub(super) server_name: ServerName<'static>,
     pub(super) prev_ech_ext: Option<EncryptedClientHello>,
+    pub(super) pake: Option<ClientPakeState>,
 }
 
 impl ClientHelloInput {
@@ -123,6 +132,15 @@ impl ClientHelloInput {
                 .unwrap_or_default(),
             crate::rand::random_u16(config.provider.secure_random)?,
         );
+        let pake = if let Some(provider) = config.pake.as_ref() {
+            let client_hello_extension = provider.client_hello_extension()?;
+            Some(ClientPakeState {
+                provider: Arc::clone(provider),
+                client_hello_extension,
+            })
+        } else {
+            None
+        };
 
         Ok(Self {
             resuming,
@@ -132,6 +150,7 @@ impl ClientHelloInput {
             session_id,
             server_name,
             prev_ech_ext: None,
+            pake,
             config,
         })
     }
@@ -150,6 +169,8 @@ impl ClientHelloInput {
             transcript_buffer.set_client_auth_enabled();
         }
 
+        // Generate key_share even in PAKE mode — Apple clients send both
+        // key_share and PAKE extension; the server chooses which to use.
         let key_share = if self.config.needs_key_share() {
             Some(tls13::initial_key_share(
                 &self.config,
@@ -196,6 +217,10 @@ fn emit_client_hello_for_retry(
     mut ech_state: Option<EchState>,
 ) -> NextStateOrError<'static> {
     let config = &input.config;
+    let pake_client_hello = input
+        .pake
+        .as_ref()
+        .map(|pake| pake.client_hello_extension.clone());
     // Defense in depth: the ECH state should be None if ECH is disabled based on config
     // builder semantics.
     let forbids_tls12 = cx.common.is_quic() || ech_state.is_some();
@@ -209,22 +234,26 @@ fn emit_client_hello_for_retry(
     assert!(supported_versions.any(|_| true));
 
     let mut exts = Box::new(ClientExtensions {
-        // offer groups which are usable for any offered version
+        // Send supported_groups even in PAKE mode — Apple clients send both
+        // key_share and PAKE extension for backward compatibility.
         named_groups: Some(
             config
                 .provider
                 .kx_groups
                 .iter()
-                .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
+                .filter(|skxg| {
+                    supported_versions.any(|v| skxg.usable_for_version(v))
+                })
                 .map(|skxg| skxg.name())
                 .collect(),
         ),
         supported_versions: Some(supported_versions),
-        signature_schemes: Some(
-            config
-                .verifier
-                .supported_verify_schemes(),
-        ),
+        signature_schemes: Some(if pake_client_hello.is_some() {
+            // Wire-fidelity with Apple PAKE ClientHello: single signature algorithm.
+            vec![SignatureScheme::ECDSA_NISTP256_SHA256]
+        } else {
+            config.verifier.supported_verify_schemes()
+        }),
         extended_master_secret_request: Some(()),
         certificate_status_request: Some(CertificateStatusRequest::build_ocsp()),
         protocols: extra_exts.protocols.clone(),
@@ -236,6 +265,9 @@ fn emit_client_hello_for_retry(
         Some(TransportParameters::QuicDraft(v)) => exts.transport_parameters_draft = Some(v),
         None => {}
     };
+    if let Some(pake_client_hello) = &pake_client_hello {
+        exts.pake = Some(Payload::new(pake_client_hello.clone()));
+    }
 
     if supported_versions.tls13 {
         if let Some(cas_extension) = config.verifier.root_hint_subjects() {
@@ -243,12 +275,14 @@ fn emit_client_hello_for_retry(
         }
     }
 
-    // Send the ECPointFormat extension only if we are proposing ECDHE
-    if config
-        .provider
-        .kx_groups
-        .iter()
-        .any(|skxg| skxg.name().key_exchange_algorithm() == KeyExchangeAlgorithm::ECDHE)
+    // Send ec_point_formats only in non-PAKE mode.
+    // Apple omits this TLS 1.2 extension in PAKE ClientHello.
+    if pake_client_hello.is_none()
+        && config
+            .provider
+            .kx_groups
+            .iter()
+            .any(|skxg| skxg.name().key_exchange_algorithm() == KeyExchangeAlgorithm::ECDHE)
     {
         exts.ec_point_formats = Some(SupportedEcPointFormats::default());
     }
@@ -271,6 +305,8 @@ fn emit_client_hello_for_retry(
         (None, false) => None,
     };
 
+    // Send key_share even in PAKE mode — Apple clients send both key_share
+    // and PAKE extension; the server chooses which mechanism to use.
     if let Some(key_share) = &key_share {
         debug_assert!(supported_versions.tls13);
         let mut shares = vec![KeyShareEntry::new(key_share.group(), key_share.pub_key())];
@@ -279,10 +315,6 @@ fn emit_client_hello_for_retry(
             .map(|rr| rr.key_share.is_some())
             .unwrap_or_default()
         {
-            // Only for the initial client hello, or a HRR that does not specify a kx group,
-            // see if we can send a second KeyShare for "free".  We only do this if the same
-            // algorithm is also supported separately by our provider for this version
-            // (`find_kx_group` looks that up).
             if let Some((component_group, component_share)) =
                 key_share
                     .hybrid_component()
@@ -304,8 +336,7 @@ fn emit_client_hello_for_retry(
     }
 
     if supported_versions.tls13 {
-        // We could support PSK_KE here too. Such connections don't
-        // have forward secrecy, and are similar to TLS1.2 resumption.
+        // Apple sends psk_key_exchange_modes even in PAKE mode.
         exts.preshared_key_modes = Some(PskKeyExchangeModes {
             psk: false,
             psk_dhe: true,
@@ -350,7 +381,11 @@ fn emit_client_hello_for_retry(
     }
 
     // Do we have a SessionID or ticket cached for this host?
-    let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx, config);
+    let tls13_session = if pake_client_hello.is_some() {
+        None
+    } else {
+        prepare_resumption(&input.resuming, &mut exts, suite, cx, config)
+    };
 
     // Extensions MAY be randomized
     // but they also need to keep the same order as the previous ClientHello
@@ -809,8 +844,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
                     suite,
                     transcript,
                     self.early_data_key_schedule,
-                    // We always send a key share when TLS 1.3 is enabled.
-                    self.offered_key_share.unwrap(),
+                    self.offered_key_share,
                     &m,
                     self.ech_state,
                     self.input,
@@ -850,8 +884,12 @@ impl ExpectServerHelloOrHelloRetryRequest {
 
         cx.common.check_aligned_handshake()?;
 
-        // We always send a key share when TLS 1.3 is enabled.
-        let offered_key_share = self.next.offered_key_share.unwrap();
+        let Some(offered_key_share) = self.next.offered_key_share.take() else {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::IllegalParameter,
+                Error::General("received HelloRetryRequest while using PAKE".into()),
+            ));
+        };
 
         // A retry request is illegal if it contains no cookie and asks for
         // retry of a group we already sent.

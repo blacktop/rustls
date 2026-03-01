@@ -54,6 +54,7 @@ static ALLOWED_PLAINTEXT_EXTS: &[ExtensionType] = &[
     ExtensionType::KeyShare,
     ExtensionType::PreSharedKey,
     ExtensionType::SupportedVersions,
+    ExtensionType::PAKE,
 ];
 
 // Only the intersection of things we offer, and those disallowed
@@ -74,22 +75,12 @@ pub(super) fn handle_server_hello(
     suite: &'static Tls13CipherSuite,
     mut transcript: HandshakeHash,
     early_data_key_schedule: Option<KeyScheduleEarly>,
-    our_key_share: Box<dyn ActiveKeyExchange>,
+    our_key_share: Option<Box<dyn ActiveKeyExchange>>,
     server_hello_msg: &Message<'_>,
     ech_state: Option<EchState>,
     input: ClientHelloInput,
 ) -> hs::NextStateOrError<'static> {
     validate_server_hello(cx.common, server_hello)?;
-
-    let their_key_share = server_hello
-        .key_share
-        .as_ref()
-        .ok_or_else(|| {
-            cx.common.send_fatal_alert(
-                AlertDescription::MissingExtension,
-                PeerMisbehaved::MissingKeyShare,
-            )
-        })?;
 
     let ClientHelloInput {
         config,
@@ -97,8 +88,23 @@ pub(super) fn handle_server_hello(
         mut sent_tls13_fake_ccs,
         mut hello,
         server_name,
+        pake,
         ..
     } = input;
+
+    let using_pake = pake.is_some();
+    if using_pake && server_hello.key_share.is_some() {
+        return Err(cx.common.send_fatal_alert(
+            AlertDescription::IllegalParameter,
+            Error::General("server sent key_share while PAKE is active".into()),
+        ));
+    }
+    if using_pake && server_hello.preshared_key.is_some() {
+        return Err(cx.common.send_fatal_alert(
+            AlertDescription::IllegalParameter,
+            Error::General("server sent pre_shared_key while PAKE is active".into()),
+        ));
+    }
 
     let mut resuming_session = match resuming {
         Some(Retrieved {
@@ -107,14 +113,6 @@ pub(super) fn handle_server_hello(
         }) => Some(value),
         _ => None,
     };
-
-    let our_key_share = KeyExchangeChoice::new(&config, cx, our_key_share, their_key_share)
-        .map_err(|_| {
-            cx.common.send_fatal_alert(
-                AlertDescription::IllegalParameter,
-                PeerMisbehaved::WrongGroupForKeyShare,
-            )
-        })?;
 
     let key_schedule_pre_handshake = match (server_hello.preshared_key, early_data_key_schedule) {
         (Some(selected_psk), Some(early_key_schedule)) => {
@@ -168,15 +166,61 @@ pub(super) fn handle_server_hello(
         }
     };
 
-    cx.common.kx_state.complete();
-    let shared_secret = our_key_share
-        .complete(&their_key_share.payload.0)
-        .map_err(|err| {
-            cx.common
-                .send_fatal_alert(AlertDescription::IllegalParameter, err)
+    let mut server_kx_hint = None;
+    let mut key_schedule = if let Some(pake_state) = pake {
+        let server_pake_extension = server_hello.pake.as_ref().ok_or_else(|| {
+            cx.common.send_fatal_alert(
+                AlertDescription::MissingExtension,
+                Error::General("missing PAKE extension in ServerHello".into()),
+            )
         })?;
-
-    let mut key_schedule = key_schedule_pre_handshake.into_handshake(shared_secret);
+        let shared_secret = pake_state
+            .provider
+            .complete_with_server_hello_extension(server_pake_extension.bytes())
+            .map_err(|err| {
+                cx.common
+                    .send_fatal_alert(AlertDescription::HandshakeFailure, err)
+            })?;
+        if shared_secret.is_empty() {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::HandshakeFailure,
+                Error::General("PAKE shared secret is empty".into()),
+            ));
+        }
+        key_schedule_pre_handshake.into_handshake_secret_bytes(&shared_secret)
+    } else {
+        let their_key_share = server_hello
+            .key_share
+            .as_ref()
+            .ok_or_else(|| {
+                cx.common.send_fatal_alert(
+                    AlertDescription::MissingExtension,
+                    PeerMisbehaved::MissingKeyShare,
+                )
+            })?;
+        let our_key_share = our_key_share.ok_or_else(|| {
+            cx.common.send_fatal_alert(
+                AlertDescription::HandshakeFailure,
+                Error::General("missing local key share for TLS 1.3 handshake".into()),
+            )
+        })?;
+        let our_key_share = KeyExchangeChoice::new(&config, cx, our_key_share, their_key_share)
+            .map_err(|_| {
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::WrongGroupForKeyShare,
+                )
+            })?;
+        cx.common.kx_state.complete();
+        let shared_secret = our_key_share
+            .complete(&their_key_share.payload.0)
+            .map_err(|err| {
+                cx.common
+                    .send_fatal_alert(AlertDescription::IllegalParameter, err)
+            })?;
+        server_kx_hint = Some(their_key_share.group);
+        key_schedule_pre_handshake.into_handshake(shared_secret)
+    };
 
     // If we have ECH state, check that the server accepted our offer.
     if let Some(ech_state) = ech_state {
@@ -214,11 +258,13 @@ pub(super) fn handle_server_hello(
         };
     }
 
-    // Remember what KX group the server liked for next time.
-    config
-        .resumption
-        .store
-        .set_kx_hint(server_name.clone(), their_key_share.group);
+    if let Some(server_kx_hint) = server_kx_hint {
+        // Remember what KX group the server liked for next time.
+        config
+            .resumption
+            .store
+            .set_kx_hint(server_name.clone(), server_kx_hint);
+    }
 
     // If we change keying when a subsequent handshake message is being joined,
     // the two halves will have different record layer protections.  Disallow this.
@@ -245,6 +291,7 @@ pub(super) fn handle_server_hello(
         transcript,
         key_schedule,
         hello,
+        using_pake,
     }))
 }
 
@@ -480,6 +527,7 @@ struct ExpectEncryptedExtensions {
     transcript: HandshakeHash,
     key_schedule: KeyScheduleHandshake,
     hello: ClientHelloDetails,
+    using_pake: bool,
 }
 
 impl State<ClientConnectionData> for ExpectEncryptedExtensions {
@@ -602,6 +650,25 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
                 cx.common
                     .handshake_kind
                     .get_or_insert(HandshakeKind::Full);
+
+                // PAKE mode: server doesn't send Certificate/CertificateVerify.
+                // Trust is established through the PAKE, not certificates.
+                if self.using_pake {
+                    let cert_verified = verify::ServerCertVerified::assertion();
+                    let sig_verified = verify::HandshakeSignatureValid::assertion();
+                    return Ok(Box::new(ExpectFinished {
+                        config: self.config,
+                        server_name: self.server_name,
+                        randoms: self.randoms,
+                        suite: self.suite,
+                        transcript: self.transcript,
+                        key_schedule: self.key_schedule,
+                        client_auth: None,
+                        cert_verified,
+                        sig_verified,
+                        ech_retry_configs,
+                    }));
+                }
 
                 Ok(if self.hello.offered_cert_compression {
                     Box::new(ExpectCertificateOrCompressedCertificateOrCertReq {

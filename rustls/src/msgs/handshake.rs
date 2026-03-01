@@ -920,6 +920,10 @@ extension_struct! {
         ExtensionType::TransportParametersDraft =>
             pub(crate) transport_parameters_draft: Option<Payload<'a>>,
 
+        /// Private PAKE extension (SwiftTLS interop).
+        ExtensionType::PAKE =>
+            pub(crate) pake: Option<Payload<'a>>,
+
         /// Encrypted inner client hello (draft-ietf-tls-esni)
         ExtensionType::EncryptedClientHello =>
             pub(crate) encrypted_client_hello: Option<EncryptedClientHello>,
@@ -960,6 +964,7 @@ impl ClientExtensions<'_> {
             transport_parameters,
             renegotiation_info,
             transport_parameters_draft,
+            pake,
             encrypted_client_hello,
             encrypted_client_hello_outer,
             order_seed,
@@ -987,6 +992,7 @@ impl ClientExtensions<'_> {
             transport_parameters: transport_parameters.map(|x| x.into_owned()),
             renegotiation_info,
             transport_parameters_draft: transport_parameters_draft.map(|x| x.into_owned()),
+            pake: pake.map(|x| x.into_owned()),
             encrypted_client_hello,
             encrypted_client_hello_outer,
             order_seed,
@@ -1192,6 +1198,10 @@ extension_struct! {
         ExtensionType::EarlyData =>
             pub(crate) early_data_ack: Option<()>,
 
+        /// Private PAKE extension (SwiftTLS interop).
+        ExtensionType::PAKE =>
+            pub(crate) pake: Option<Payload<'a>>,
+
         /// Encrypted inner client hello response (draft-ietf-tls-esni)
         ExtensionType::EncryptedClientHello =>
             pub(crate) encrypted_client_hello_ack: Option<ServerEncryptedClientHello>,
@@ -1218,6 +1228,7 @@ impl ServerExtensions<'_> {
             transport_parameters,
             transport_parameters_draft,
             early_data_ack,
+            pake,
             encrypted_client_hello_ack,
             unknown_extensions,
         } = self;
@@ -1237,6 +1248,7 @@ impl ServerExtensions<'_> {
             transport_parameters: transport_parameters.map(|x| x.into_owned()),
             transport_parameters_draft: transport_parameters_draft.map(|x| x.into_owned()),
             early_data_ack,
+            pake: pake.map(|x| x.into_owned()),
             encrypted_client_hello_ack,
             unknown_extensions,
         }

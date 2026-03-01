@@ -20,6 +20,7 @@ use crate::kernel::KernelConnection;
 use crate::log::trace;
 use crate::msgs::enums::NamedGroup;
 use crate::msgs::handshake::ClientExtensionsInput;
+use crate::pake::PakeClient;
 use crate::msgs::persist;
 use crate::suites::{ExtractedSecrets, SupportedCipherSuite};
 use crate::sync::Arc;
@@ -281,6 +282,13 @@ pub struct ClientConfig {
 
     /// How to offer Encrypted Client Hello (ECH). The default is to not offer ECH.
     pub(super) ech_mode: Option<EchMode>,
+
+    /// Optional PAKE integration for custom TLS 1.3 key exchange.
+    ///
+    /// When set, rustls emits a PAKE extension in `ClientHello`, expects a PAKE
+    /// extension in `ServerHello`, and uses the callback-provided PAKE shared
+    /// secret in place of ECDHE for the TLS 1.3 handshake secret.
+    pub pake: Option<Arc<dyn PakeClient>>,
 }
 
 impl ClientConfig {
@@ -398,7 +406,7 @@ impl ClientConfig {
     }
 
     pub(super) fn needs_key_share(&self) -> bool {
-        self.supports_version(ProtocolVersion::TLSv1_3)
+        self.supports_version(ProtocolVersion::TLSv1_3) && self.pake.is_none()
     }
 
     /// We support a given TLS version if it's quoted in the configured

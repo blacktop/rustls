@@ -461,6 +461,8 @@ mod key_log_file;
 mod suites;
 mod versions;
 mod webpki;
+/// APIs for integrating custom PAKE exchanges into TLS handshakes.
+pub mod pake;
 
 /// Internal classes that are used in integration tests.
 /// The contents of this section DO NOT form part of the stable interface.
@@ -556,6 +558,7 @@ pub use crate::error::{
     PeerMisbehaved,
 };
 pub use crate::key_log::{KeyLog, NoKeyLog};
+pub use crate::pake::{PakeClient, PakeServer, PakeServerResponse};
 #[cfg(feature = "std")]
 pub use crate::key_log_file::KeyLogFile;
 pub use crate::msgs::enums::NamedGroup;
@@ -694,6 +697,7 @@ pub mod ticketer;
 
 /// This is the rustls manual.
 pub mod manual;
+
 
 pub mod time_provider;
 

@@ -27,6 +27,7 @@ use crate::log::trace;
 use crate::msgs::base::Payload;
 use crate::msgs::handshake::{ClientHelloPayload, ProtocolName, ServerExtensionsInput};
 use crate::msgs::message::Message;
+use crate::pake::PakeServer;
 use crate::suites::ExtractedSecrets;
 use crate::sync::Arc;
 #[cfg(feature = "std")]
@@ -446,6 +447,13 @@ pub struct ServerConfig {
     ///
     /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
+
+    /// Optional PAKE integration for custom TLS 1.3 key exchange.
+    ///
+    /// When set, rustls expects a PAKE extension in `ClientHello`, emits a PAKE
+    /// extension in `ServerHello`, and uses the callback-provided PAKE shared
+    /// secret in place of ECDHE for the TLS 1.3 handshake secret.
+    pub pake: Option<Arc<dyn PakeServer>>,
 }
 
 impl ServerConfig {

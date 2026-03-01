@@ -50,6 +50,7 @@ mod client_hello {
         ClientHelloPayload, HelloRetryRequest, HelloRetryRequestExtensions, KeyShareEntry, Random,
         ServerExtensions, ServerExtensionsInput, ServerHelloPayload, SessionId,
     };
+    use crate::pake::PakeServerResponse;
     use crate::server::common::ActiveCertifiedKey;
     use crate::sign;
     use crate::tls13::key_schedule::{
@@ -150,17 +151,19 @@ mod client_hello {
 
             sigschemes_ext.retain(SignatureScheme::supported_in_tls13);
 
-            let shares_ext = client_hello
-                .key_shares
-                .as_ref()
-                .ok_or_else(|| {
+            let using_pake = self.config.pake.is_some();
+            let shares_ext = if using_pake {
+                None
+            } else {
+                Some(client_hello.key_shares.as_ref().ok_or_else(|| {
                     cx.common.send_fatal_alert(
                         AlertDescription::HandshakeFailure,
                         PeerIncompatible::KeyShareExtensionRequired,
                     )
-                })?;
+                })?)
+            };
 
-            if client_hello.has_keyshare_extension_with_duplicates() {
+            if !using_pake && client_hello.has_keyshare_extension_with_duplicates() {
                 return Err(cx.common.send_fatal_alert(
                     AlertDescription::IllegalParameter,
                     PeerMisbehaved::OfferedDuplicateKeyShares,
@@ -200,134 +203,170 @@ mod client_hello {
                 });
             }
 
-            // See if there is a KeyShare for the selected kx group.
-            let chosen_share_and_kxg = shares_ext.iter().find_map(|share| {
-                (share.group == selected_kxg.name()).then_some((share, selected_kxg))
-            });
-
-            let Some(chosen_share_and_kxg) = chosen_share_and_kxg else {
-                // We don't have a suitable key share.  Send a HelloRetryRequest
-                // for the mutually_preferred_group.
-                self.transcript.add_message(chm);
-
-                if self.done_retry {
-                    return Err(cx.common.send_fatal_alert(
-                        AlertDescription::IllegalParameter,
-                        PeerMisbehaved::RefusedToFollowHelloRetryRequest,
-                    ));
-                }
-
-                emit_hello_retry_request(
-                    &mut self.transcript,
-                    self.suite,
-                    client_hello.session_id,
-                    cx.common,
-                    selected_kxg.name(),
-                );
-                emit_fake_ccs(cx.common);
-
-                let skip_early_data = max_early_data_size(self.config.max_early_data_size);
-
-                let next = Box::new(hs::ExpectClientHello {
-                    config: self.config,
-                    transcript: HandshakeHashOrBuffer::Hash(self.transcript),
-                    #[cfg(feature = "tls12")]
-                    session_id: SessionId::empty(),
-                    #[cfg(feature = "tls12")]
-                    using_ems: false,
-                    done_retry: true,
-                    send_tickets: self.send_tickets,
-                    extra_exts: self.extra_exts,
+            let mut chosen_share_and_kxg = None;
+            if let Some(shares_ext) = shares_ext {
+                // See if there is a KeyShare for the selected kx group.
+                chosen_share_and_kxg = shares_ext.iter().find_map(|share| {
+                    (share.group == selected_kxg.name()).then_some((share, selected_kxg))
                 });
 
-                return if early_data_requested {
-                    Ok(Box::new(ExpectAndSkipRejectedEarlyData {
-                        skip_data_left: skip_early_data,
-                        next,
-                    }))
-                } else {
-                    Ok(next)
-                };
-            };
+                if chosen_share_and_kxg.is_none() {
+                    // We don't have a suitable key share.  Send a HelloRetryRequest
+                    // for the mutually_preferred_group.
+                    self.transcript.add_message(chm);
+
+                    if self.done_retry {
+                        return Err(cx.common.send_fatal_alert(
+                            AlertDescription::IllegalParameter,
+                            PeerMisbehaved::RefusedToFollowHelloRetryRequest,
+                        ));
+                    }
+
+                    emit_hello_retry_request(
+                        &mut self.transcript,
+                        self.suite,
+                        client_hello.session_id,
+                        cx.common,
+                        selected_kxg.name(),
+                    );
+                    emit_fake_ccs(cx.common);
+
+                    let skip_early_data = max_early_data_size(self.config.max_early_data_size);
+
+                    let next = Box::new(hs::ExpectClientHello {
+                        config: self.config,
+                        transcript: HandshakeHashOrBuffer::Hash(self.transcript),
+                        #[cfg(feature = "tls12")]
+                        session_id: SessionId::empty(),
+                        #[cfg(feature = "tls12")]
+                        using_ems: false,
+                        done_retry: true,
+                        send_tickets: self.send_tickets,
+                        extra_exts: self.extra_exts,
+                    });
+
+                    return if early_data_requested {
+                        Ok(Box::new(ExpectAndSkipRejectedEarlyData {
+                            skip_data_left: skip_early_data,
+                            next,
+                        }))
+                    } else {
+                        Ok(next)
+                    };
+                }
+            }
+
+            let mut pake_result = None;
+            if using_pake {
+                // Apple clients send key_share alongside the PAKE extension for
+                // backward compatibility — the server ignores key_share when
+                // PAKE takes priority. Do NOT reject key_share or PSK here.
+                let client_pake_extension = client_hello.pake.as_ref().ok_or_else(|| {
+                    cx.common.send_fatal_alert(
+                        AlertDescription::MissingExtension,
+                        Error::General("missing PAKE extension in ClientHello".into()),
+                    )
+                })?;
+                let provider = self.config.pake.as_ref().ok_or_else(|| {
+                    cx.common.send_fatal_alert(
+                        AlertDescription::HandshakeFailure,
+                        Error::General("PAKE provider missing from server config".into()),
+                    )
+                })?;
+                pake_result = Some(
+                    provider
+                        .handle_client_hello_extension(client_pake_extension.bytes())
+                        .map_err(|err| {
+                            cx.common
+                                .send_fatal_alert(AlertDescription::HandshakeFailure, err)
+                        })?,
+                );
+            }
 
             let mut chosen_psk_index = None;
             let mut resumedata = None;
 
-            if let Some(psk_offer) = &client_hello.preshared_key_offer {
-                // "A client MUST provide a "psk_key_exchange_modes" extension if it
-                //  offers a "pre_shared_key" extension. If clients offer
-                //  "pre_shared_key" without a "psk_key_exchange_modes" extension,
-                //  servers MUST abort the handshake." - RFC8446 4.2.9
-                if client_hello
-                    .preshared_key_modes
-                    .is_none()
-                {
-                    return Err(cx.common.send_fatal_alert(
-                        AlertDescription::MissingExtension,
-                        PeerMisbehaved::MissingPskModesExtension,
-                    ));
-                }
-
-                if psk_offer.binders.is_empty() {
-                    return Err(cx.common.send_fatal_alert(
-                        AlertDescription::DecodeError,
-                        PeerMisbehaved::MissingBinderInPskExtension,
-                    ));
-                }
-
-                if psk_offer.binders.len() != psk_offer.identities.len() {
-                    return Err(cx.common.send_fatal_alert(
-                        AlertDescription::IllegalParameter,
-                        PeerMisbehaved::PskExtensionWithMismatchedIdsAndBinders,
-                    ));
-                }
-
-                let now = self.config.current_time()?;
-
-                for (i, psk_id) in psk_offer.identities.iter().enumerate() {
-                    let maybe_resume_data = self
-                        .attempt_tls13_ticket_decryption(&psk_id.identity.0)
-                        .map(|resumedata| {
-                            resumedata.set_freshness(psk_id.obfuscated_ticket_age, now)
-                        })
-                        .filter(|resumedata| {
-                            hs::can_resume(self.suite.into(), &cx.data.sni, false, resumedata)
-                        });
-
-                    let Some(resume) = maybe_resume_data else {
-                        continue;
-                    };
-
-                    if !self.check_binder(
-                        self.suite,
-                        chm,
-                        &resume.master_secret.0,
-                        psk_offer.binders[i].as_ref(),
-                    ) {
+            if !using_pake {
+                if let Some(psk_offer) = &client_hello.preshared_key_offer {
+                    // "A client MUST provide a "psk_key_exchange_modes" extension if it
+                    //  offers a "pre_shared_key" extension. If clients offer
+                    //  "pre_shared_key" without a "psk_key_exchange_modes" extension,
+                    //  servers MUST abort the handshake." - RFC8446 4.2.9
+                    if client_hello
+                        .preshared_key_modes
+                        .is_none()
+                    {
                         return Err(cx.common.send_fatal_alert(
-                            AlertDescription::DecryptError,
-                            PeerMisbehaved::IncorrectBinder,
+                            AlertDescription::MissingExtension,
+                            PeerMisbehaved::MissingPskModesExtension,
                         ));
                     }
 
-                    chosen_psk_index = Some(i);
-                    resumedata = Some(resume);
-                    break;
+                    if psk_offer.binders.is_empty() {
+                        return Err(cx.common.send_fatal_alert(
+                            AlertDescription::DecodeError,
+                            PeerMisbehaved::MissingBinderInPskExtension,
+                        ));
+                    }
+
+                    if psk_offer.binders.len() != psk_offer.identities.len() {
+                        return Err(cx.common.send_fatal_alert(
+                            AlertDescription::IllegalParameter,
+                            PeerMisbehaved::PskExtensionWithMismatchedIdsAndBinders,
+                        ));
+                    }
+
+                    let now = self.config.current_time()?;
+
+                    for (i, psk_id) in psk_offer.identities.iter().enumerate() {
+                        let maybe_resume_data = self
+                            .attempt_tls13_ticket_decryption(&psk_id.identity.0)
+                            .map(|resumedata| {
+                                resumedata.set_freshness(psk_id.obfuscated_ticket_age, now)
+                            })
+                            .filter(|resumedata| {
+                                hs::can_resume(self.suite.into(), &cx.data.sni, false, resumedata)
+                            });
+
+                        let Some(resume) = maybe_resume_data else {
+                            continue;
+                        };
+
+                        if !self.check_binder(
+                            self.suite,
+                            chm,
+                            &resume.master_secret.0,
+                            psk_offer.binders[i].as_ref(),
+                        ) {
+                            return Err(cx.common.send_fatal_alert(
+                                AlertDescription::DecryptError,
+                                PeerMisbehaved::IncorrectBinder,
+                            ));
+                        }
+
+                        chosen_psk_index = Some(i);
+                        resumedata = Some(resume);
+                        break;
+                    }
                 }
             }
 
-            if !client_hello
-                .preshared_key_modes
-                .as_ref()
-                .map(|offer| offer.psk_dhe)
-                .unwrap_or_default()
-            {
-                debug!("Client unwilling to resume, PSK_DHE_KE not offered");
+            if using_pake {
                 self.send_tickets = 0;
-                chosen_psk_index = None;
-                resumedata = None;
             } else {
-                self.send_tickets = self.config.send_tls13_tickets;
+                if !client_hello
+                    .preshared_key_modes
+                    .as_ref()
+                    .map(|offer| offer.psk_dhe)
+                    .unwrap_or_default()
+                {
+                    debug!("Client unwilling to resume, PSK_DHE_KE not offered");
+                    self.send_tickets = 0;
+                    chosen_psk_index = None;
+                    resumedata = None;
+                } else {
+                    self.send_tickets = self.config.send_tls13_tickets;
+                }
             }
 
             if let Some(resume) = &resumedata {
@@ -339,13 +378,23 @@ mod client_hello {
 
             let full_handshake = resumedata.is_none();
             self.transcript.add_message(chm);
+            let handshake_material = if let Some(pake_result) = pake_result {
+                HandshakeMaterial::Pake(pake_result)
+            } else if let Some(chosen_share_and_kxg) = chosen_share_and_kxg {
+                HandshakeMaterial::KeyShare(chosen_share_and_kxg)
+            } else {
+                return Err(cx.common.send_fatal_alert(
+                    AlertDescription::HandshakeFailure,
+                    Error::General("missing TLS 1.3 handshake material".into()),
+                ));
+            };
             let key_schedule = emit_server_hello(
                 &mut self.transcript,
                 &self.randoms,
                 self.suite,
                 cx,
                 &client_hello.session_id,
-                chosen_share_and_kxg,
+                handshake_material,
                 chosen_psk_index,
                 resumedata
                     .as_ref()
@@ -377,7 +426,11 @@ mod client_hello {
                 &self.config,
             )?;
 
-            let doing_client_auth = if full_handshake {
+            let doing_client_auth = if using_pake {
+                // PAKE mode: skip Certificate/CertificateVerify/CertificateRequest.
+                // Trust is established through the PAKE key agreement.
+                false
+            } else if full_handshake {
                 let client_auth = emit_certificate_req_tls13(&mut flight, &self.config)?;
 
                 if let Some(compressor) = cert_compressor {
@@ -484,32 +537,52 @@ mod client_hello {
         }
     }
 
+    enum HandshakeMaterial<'a> {
+        KeyShare((&'a KeyShareEntry, &'static dyn SupportedKxGroup)),
+        Pake(PakeServerResponse),
+    }
+
     fn emit_server_hello(
         transcript: &mut HandshakeHash,
         randoms: &ConnectionRandoms,
         suite: &'static Tls13CipherSuite,
         cx: &mut ServerContext<'_>,
         session_id: &SessionId,
-        share_and_kxgroup: (&KeyShareEntry, &'static dyn SupportedKxGroup),
+        handshake_material: HandshakeMaterial<'_>,
         chosen_psk_idx: Option<usize>,
         resuming_psk: Option<&[u8]>,
         config: &ServerConfig,
     ) -> Result<KeyScheduleHandshake, Error> {
-        // Prepare key exchange; the caller already found the matching SupportedKxGroup
-        let (share, kxgroup) = share_and_kxgroup;
-        debug_assert_eq!(kxgroup.name(), share.group);
-        let ckx = kxgroup
-            .start_and_complete(&share.payload.0)
-            .map_err(|err| {
-                cx.common
-                    .send_fatal_alert(AlertDescription::IllegalParameter, err)
-            })?;
-        cx.common.kx_state.complete();
+        let (key_share_ext, pake_ext, shared_secret) = match handshake_material {
+            HandshakeMaterial::KeyShare((share, kxgroup)) => {
+                debug_assert_eq!(kxgroup.name(), share.group);
+                let ckx = kxgroup
+                    .start_and_complete(&share.payload.0)
+                    .map_err(|err| {
+                        cx.common
+                            .send_fatal_alert(AlertDescription::IllegalParameter, err)
+                    })?;
+                (
+                    Some(KeyShareEntry::new(ckx.group, ckx.pub_key)),
+                    None,
+                    ckx.secret.secret_bytes().to_vec(),
+                )
+            }
+            HandshakeMaterial::Pake(PakeServerResponse {
+                server_hello_extension,
+                shared_secret,
+            }) => (None, Some(Payload::new(server_hello_extension)), shared_secret),
+        };
+        // Only advance kx_state in ECDHE mode; PAKE bypasses the KX state machine.
+        if key_share_ext.is_some() {
+            cx.common.kx_state.complete();
+        }
 
         let extensions = Box::new(ServerExtensions {
-            key_share: Some(KeyShareEntry::new(ckx.group, ckx.pub_key)),
+            key_share: key_share_ext,
             selected_version: Some(ProtocolVersion::TLSv1_3),
             preshared_key: chosen_psk_idx.map(|idx| idx as u16),
+            pake: pake_ext,
             ..Default::default()
         });
 
@@ -550,8 +623,7 @@ mod client_hello {
             KeySchedulePreHandshake::new(suite)
         };
 
-        // Do key exchange
-        let key_schedule = key_schedule_pre_handshake.into_handshake(ckx.secret);
+        let key_schedule = key_schedule_pre_handshake.into_handshake_secret_bytes(&shared_secret);
 
         let handshake_hash = transcript.current_hash();
         let key_schedule = key_schedule.derive_server_handshake_secrets(
